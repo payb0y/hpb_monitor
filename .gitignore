@@ -1,0 +1,5 @@
+/.venv
+/npm/data/
+/npm/letsencrypt/
+__pycache__/
+*.pyc
