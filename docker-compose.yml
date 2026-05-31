@@ -4,8 +4,8 @@ services:
     image: hpb-monitor
     container_name: hpb-monitor
     restart: unless-stopped
-    expose:
-      - "5000"              # internal-only; never published to the host
+    ports:
+      - "127.0.0.1:5050:5000"   # loopback-only; reached via the host's nginx
     healthcheck:
       test:
         - "CMD"
@@ -16,15 +16,3 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
-
-  npm:
-    image: jc21/nginx-proxy-manager:latest
-    container_name: npm
-    restart: unless-stopped
-    ports:
-      - "80:80"             # ACME http-01 + plain proxy
-      - "443:443"           # TLS proxy
-      - "127.0.0.1:81:81"   # admin UI on loopback only — reach via SSH tunnel
-    volumes:
-      - ./npm/data:/data
-      - ./npm/letsencrypt:/etc/letsencrypt

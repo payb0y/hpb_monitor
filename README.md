@@ -40,70 +40,98 @@ second and later calls return real numbers. Gunicorn is pinned to
 
 ## Security model
 
-No app-level auth. Bring up the included `npm` (nginx-proxy-manager) and
-restrict the proxy host to the Nextcloud host's public IP via an Access
-List. The monitor publishes no ports to the host, so the only way in is
-through npm.
+No app-level auth. The container publishes only to `127.0.0.1:5050`, so it
+is **not** reachable from the internet directly. Access goes through the
+host's existing nginx (installed by the sunweaver HPB setup) on
+`signaling.loket.site`, where a new `location /monitor/` block restricts
+the upstream callers to a single IP — the Nextcloud host that runs
+superadminpage.
 
 ## Deployment
 
-### 1. Pre-flight on the HPB host
-
-Confirm nothing else is already on 80/443:
-
-```bash
-ss -ltnp 'sport = :80 or sport = :443'
-```
-
-If something else owns those ports, free them before continuing — npm
-will fail to start otherwise. The Talk HPB signaling server usually
-listens on a non-standard port.
-
-### 2. Bring the stack up
+### 1. Bring the container up
 
 ```bash
 cd /opt/hpb_monitor    # or wherever you cloned the repo
 docker compose up -d --build
-docker compose ps
-docker compose exec hpb-monitor curl -s localhost:5000/health
-docker compose exec hpb-monitor curl -s localhost:5000/stats | python3 -m json.tool
+docker compose ps      # hpb-monitor reaches "Up (healthy)" within ~40 s
+
+# From the HPB host shell only — confirm the container responds:
+curl -s localhost:5050/health
+curl -s localhost:5050/stats | python3 -m json.tool
 ```
 
-Both containers `Up`; `hpb-monitor` should reach `Up (healthy)` within ~40 s.
+The port `5050` is bound to `127.0.0.1` only, so the public IP
+`46.224.7.132:5050` is **not** reachable — that's intentional.
 
-### 3. Open the npm admin UI via SSH tunnel
+### 2. Add the nginx location block
+
+Find the existing `signaling.loket.site` server block (usually
+`/etc/nginx/sites-available/signaling.loket.site`, symlinked from
+`sites-enabled/`). **Inside** the existing `server { listen 443 ssl; ... }`
+block, add:
+
+```nginx
+# Path-routed metrics endpoint for hpb_monitor.
+# Only the Nextcloud host (superadminpage) is allowed to poll it.
+location /monitor/ {
+    allow 185.169.252.206;     # Nextcloud host public IP
+    deny all;
+
+    proxy_pass http://127.0.0.1:5050/;
+    proxy_http_version 1.1;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_read_timeout    5s;
+    proxy_connect_timeout 3s;
+}
+```
+
+The trailing `/` on `proxy_pass http://127.0.0.1:5050/;` is required — it
+strips the `/monitor/` prefix so a request to
+`https://signaling.loket.site/monitor/health` reaches the container as
+`/health`. Do **not** drop the trailing slash, and do not remove any
+existing `location` directives in the server block.
+
+### 3. Reload nginx safely
 
 ```bash
-ssh -L 8181:localhost:81 root@46.224.7.132
+nginx -t                       # config syntax check
+systemctl reload nginx
 ```
 
-Then browse to `http://localhost:8181`. Default credentials
-`admin@example.com` / `changeme`. **Change the password immediately.**
+If `nginx -t` reports an error, fix and re-run — do **not** reload until
+it passes, or signaling will go down for active Talk calls.
 
-### 4. Create an Access List in npm
-
-Name it `nextcloud-admin-only`. *Access* tab: add an Allow rule with the
-Nextcloud host's public IP. *Satisfy* = *All*. Save.
-
-### 5. Create a Proxy Host
-
-Pick a hostname (e.g. `hpb-monitor.loket.site`) and point its DNS A
-record at this server. In npm:
-
-- Scheme `http`, Forward Hostname `hpb-monitor`, Forward Port `5000`.
-- *SSL* tab → request a Let's Encrypt cert. Tick "Force SSL", "HTTP/2",
-  agree to TOS.
-- *Access List* tab → select `nextcloud-admin-only`. Save.
-
-### 6. Smoke test from the Nextcloud host
+### 4. Smoke test from the Nextcloud host (185.169.252.206)
 
 ```bash
-curl -s https://hpb-monitor.loket.site/health
-curl -s https://hpb-monitor.loket.site/stats | jq '{m:.memory.percent, d:.disk.percent, i:.network.interface}'
+curl -s https://signaling.loket.site/monitor/health
+curl -s https://signaling.loket.site/monitor/stats | jq '{m:.memory.percent, d:.disk.percent, i:.network.interface}'
 ```
 
-Expected: 200 JSON for both. From any other host the same `curl` should
-return `403` (npm Access List rejecting).
+Expected: 200 JSON for both. The network rates are `null` on the first
+request and real numbers on subsequent requests.
+
+### 5. Deny test from anywhere else
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" https://signaling.loket.site/monitor/health
+```
+
+Expected: `403` (nginx allow/deny rejecting).
+
+### 6. Sanity-check signaling is unchanged
+
+```bash
+curl -s https://signaling.loket.site/         # should respond exactly as before
+```
+
+The new `/monitor/` location is purely additive; if anything else on
+`signaling.loket.site` started misbehaving after the reload, double-check
+you didn't paste the snippet inside a wrong server block (e.g. an HTTP→HTTPS
+redirect block instead of the `:443 ssl` block).
 
 ### 7. Optional: give the container a readable hostname
 
